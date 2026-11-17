@@ -1,17 +1,25 @@
-"""Answer generator module integrating retrieved document chunks with Google Gemini.
+"""Answer generator module integrating retrieved document chunks with Groq LLM.
 
 Constructs grounded prompts with strict factual boundaries, sends them to the
-Gemini API using the google-genai SDK, and returns structured answers with source citations.
+Groq API using the official groq Python SDK, and returns structured answers
+with source citations.
 """
 
 import logging
 from dataclasses import dataclass
 from typing import List, Optional
 
-from google import genai
-from google.genai.errors import APIError
+from groq import (
+    APIError,
+    AuthenticationError,
+    Groq,
+    InternalServerError,
+    NotFoundError,
+    PermissionDeniedError,
+    RateLimitError,
+)
 
-from app.config import GEMINI_API_KEY, GEMINI_MODEL
+from app.config import GROQ_API_KEY, GROQ_MODEL
 from app.retriever import SearchResult
 
 logger = logging.getLogger(__name__)
@@ -25,19 +33,19 @@ class GeneratedAnswer:
     model: str
 
 
-def get_gemini_client(api_key: Optional[str] = None) -> genai.Client:
-    """Initialize and return a google-genai Client.
+def get_groq_client(api_key: Optional[str] = None) -> Groq:
+    """Initialize and return an official Groq client.
 
     Args:
-        api_key: Optional API key override. Defaults to GEMINI_API_KEY from config.
+        api_key: Optional API key override. Defaults to GROQ_API_KEY from config.
 
     Returns:
-        Configured genai.Client instance.
+        Configured Groq client instance.
 
     Raises:
         ValueError: If no valid API key is configured or a placeholder is detected.
     """
-    key = api_key or GEMINI_API_KEY
+    key = GROQ_API_KEY if api_key is None else api_key
     if (
         not key
         or not key.strip()
@@ -45,11 +53,15 @@ def get_gemini_client(api_key: Optional[str] = None) -> genai.Client:
         or "placeholder" in key.lower()
     ):
         raise ValueError(
-            "GEMINI_API_KEY is not configured or contains a placeholder. "
+            "GROQ_API_KEY is not configured or contains a placeholder. "
             "Please configure a valid key in your .env file."
         )
 
-    return genai.Client(api_key=key.strip())
+    return Groq(api_key=key.strip())
+
+
+# Legacy alias to maintain backward compatibility with previous imports
+get_gemini_client = get_groq_client
 
 
 def format_sources(chunks: List[SearchResult]) -> List[dict]:
@@ -114,7 +126,7 @@ def build_prompt(question: str, context: str) -> str:
         context: Assembled document context string.
 
     Returns:
-        Complete prompt text for Gemini.
+        Complete prompt text for the LLM.
     """
     return (
         "You are a factual knowledge assistant for KnowledgeBase AI.\n"
@@ -139,18 +151,18 @@ def build_prompt(question: str, context: str) -> str:
 def generate_answer(
     question: str,
     chunks: List[SearchResult],
-    client: Optional[genai.Client] = None,
+    client: Optional[Groq] = None,
     model: Optional[str] = None,
 ) -> GeneratedAnswer:
-    """Generate a grounded answer for a question using retrieved chunks and Gemini.
+    """Generate a grounded answer for a question using retrieved chunks and Groq.
 
-    If no chunks are provided, returns an informative response without calling Gemini.
+    If no chunks are provided, returns an informative response without calling Groq.
 
     Args:
         question: The user's question string.
         chunks: List of retrieved SearchResult objects from app.retriever.
-        client: Optional genai.Client instance (used for dependency injection and testing).
-        model: Optional model identifier override. Defaults to GEMINI_MODEL.
+        client: Optional Groq client instance (used for dependency injection and testing).
+        model: Optional model identifier override. Defaults to GROQ_MODEL.
 
     Returns:
         A GeneratedAnswer object with answer text, source citations, and model identifier.
@@ -169,11 +181,11 @@ def generate_answer(
     if not isinstance(chunks, list):
         raise TypeError(f"Chunks must be a list of SearchResult, got {type(chunks).__name__}.")
 
-    target_model = model or GEMINI_MODEL
+    target_model = model or GROQ_MODEL
 
-    # Edge Case: If no chunks retrieved, do not waste API quota or call Gemini
+    # Edge Case: If no chunks retrieved, do not waste API quota or call Groq
     if len(chunks) == 0:
-        logger.info("No relevant chunks provided. Skipping Gemini API call.")
+        logger.info("No relevant chunks provided. Skipping Groq API call.")
         return GeneratedAnswer(
             answer="No relevant documents were found to answer your question.",
             sources=[],
@@ -186,9 +198,9 @@ def generate_answer(
 
     # Initialize client if not provided
     try:
-        llm_client = client or get_gemini_client()
+        llm_client = client or get_groq_client()
     except ValueError as e:
-        logger.error(f"Gemini client initialization failed: {e}")
+        logger.error(f"Groq client initialization failed: {e}")
         return GeneratedAnswer(
             answer=f"Configuration Error: {e}",
             sources=sources,
@@ -196,14 +208,19 @@ def generate_answer(
         )
 
     try:
-        logger.debug(f"Sending prompt to Gemini model '{target_model}'...")
-        response = llm_client.models.generate_content(
+        logger.debug(f"Sending prompt to Groq model '{target_model}'...")
+        chat_completion = llm_client.chat.completions.create(
             model=target_model,
-            contents=prompt,
+            messages=[
+                {"role": "user", "content": prompt}
+            ],
         )
 
         # Validate response
-        response_text = getattr(response, "text", None)
+        response_text = ""
+        if getattr(chat_completion, "choices", None) and len(chat_completion.choices) > 0:
+            response_text = getattr(chat_completion.choices[0].message, "content", "") or ""
+
         if response_text and response_text.strip():
             return GeneratedAnswer(
                 answer=response_text.strip(),
@@ -211,7 +228,7 @@ def generate_answer(
                 model=target_model,
             )
 
-        logger.warning("Gemini returned an empty or invalid response text.")
+        logger.warning("Groq returned an empty or invalid response text.")
         return GeneratedAnswer(
             answer="No answer text was generated by the model.",
             sources=sources,
@@ -219,33 +236,33 @@ def generate_answer(
         )
 
     except APIError as api_err:
-        err_code = getattr(api_err, "code", None)
+        status_code = getattr(api_err, "status_code", None)
         err_msg = str(api_err)
-        logger.error(f"Gemini APIError ({err_code}): {err_msg}")
+        logger.error(f"Groq APIError ({status_code}): {err_msg}")
 
-        # Specific diagnosis based on status code
-        if err_code == 400 or "API_KEY_INVALID" in err_msg:
+        # Specific diagnosis based on status code / exception class
+        if isinstance(api_err, (AuthenticationError, PermissionDeniedError)) or status_code in (401, 403):
             user_msg = (
-                "Gemini API Error: Invalid API key. "
-                "Please verify your GEMINI_API_KEY in the .env file."
+                "Groq API Error: Authentication failed (401/403). "
+                "Please verify your GROQ_API_KEY in the .env file."
             )
-        elif err_code == 404 or "NOT_FOUND" in err_msg:
+        elif isinstance(api_err, NotFoundError) or status_code == 404:
             user_msg = (
-                f"Gemini API Error: Model '{target_model}' was not found (404). "
-                "Please check the GEMINI_MODEL configuration in your .env file."
+                f"Groq API Error: Model '{target_model}' was not found (404). "
+                "Please check the GROQ_MODEL configuration in your .env file."
             )
-        elif err_code == 429 or "RESOURCE_EXHAUSTED" in err_msg:
+        elif isinstance(api_err, RateLimitError) or status_code == 429:
             user_msg = (
-                "Gemini API Error: Quota or rate limit exceeded (429). "
+                "Groq API Error: Quota or rate limit exceeded (429). "
                 "Please wait a moment before asking again."
             )
-        elif err_code == 503 or "UNAVAILABLE" in err_msg:
+        elif isinstance(api_err, InternalServerError) or (status_code and status_code >= 500):
             user_msg = (
-                f"Gemini API Error: Model '{target_model}' is temporarily unavailable or overloaded (503). "
+                f"Groq API Error: Groq service is temporarily unavailable or overloaded ({status_code}). "
                 "Your documents remain safely indexed. Please try again in a few moments."
             )
         else:
-            user_msg = f"Gemini API Error ({err_code}): {api_err.message if hasattr(api_err, 'message') else err_msg}"
+            user_msg = f"Groq API Error ({status_code}): {getattr(api_err, 'message', err_msg)}"
 
         return GeneratedAnswer(
             answer=user_msg,
@@ -254,10 +271,9 @@ def generate_answer(
         )
 
     except Exception as generic_err:
-        logger.error(f"Unexpected error calling Gemini API: {generic_err}")
+        logger.error(f"Unexpected error calling Groq API: {generic_err}")
         return GeneratedAnswer(
             answer=f"Error generating answer: {generic_err}",
             sources=sources,
             model=target_model,
         )
-

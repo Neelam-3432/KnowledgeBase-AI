@@ -14,7 +14,7 @@ from chromadb.api.models.Collection import Collection
 from google import genai
 
 from app.answer_generator import GeneratedAnswer, generate_answer
-from app.config import GEMINI_MODEL, TOP_K
+from app.config import GEMINI_MODEL, GROQ_MODEL, TOP_K
 from app.document_loader import calculate_file_hash, load_pdf
 from app.retriever import SearchResult, retrieve
 from app.text_splitter import split_documents
@@ -197,7 +197,7 @@ def answer_question(
     question: str,
     top_k: int = TOP_K,
     collection: Optional[Collection] = None,
-    client: Optional[genai.Client] = None,
+    client: Optional[Any] = None,
     model: Optional[str] = None,
 ) -> RAGAnswer:
     """Answer a user question using semantic retrieval and Gemini answer generation.
@@ -236,7 +236,7 @@ def answer_question(
     if top_k <= 0:
         raise ValueError(f"top_k must be a positive integer, got {top_k}.")
 
-    target_model = model or GEMINI_MODEL
+    target_model = model or GROQ_MODEL
     target_collection = collection or get_collection()
 
     # Step 1: Semantic retrieval
@@ -289,6 +289,8 @@ def get_pipeline_status(collection: Optional[Collection] = None) -> Dict[str, An
     return {
         "total_chunks_indexed": count,
         "collection_name": target_collection.name,
+        "model": GROQ_MODEL,
+        "groq_model": GROQ_MODEL,
         "gemini_model": GEMINI_MODEL,
     }
 

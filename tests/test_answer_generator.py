@@ -1,20 +1,29 @@
-"""Unit tests for app.answer_generator using mocked google-genai client.
+"""Unit tests for app.answer_generator using mocked Groq client.
 
 Tests cover:
 - Context construction and document formatting.
 - Source and page metadata preservation.
 - Grounding prompt construction and instruction verification.
-- Empty context handling: ensuring Gemini is NEVER called when chunks are empty.
-- Successful response extraction.
+- Empty context handling: ensuring Groq is NEVER called when chunks are empty.
+- Successful response extraction from Groq chat completion response.
 - Invalid or empty model responses.
-- APIError handling for 400, 404, 429, 503, and unexpected exceptions.
+- APIError handling for 401/403, 404, 429, 5xx, and unexpected exceptions.
 - Input validation (empty question, wrong types).
-- Missing and placeholder API key validation.
+- Missing and placeholder Groq API key validation.
 """
 
 from unittest.mock import MagicMock
-from google.genai.errors import APIError
+import httpx
 import pytest
+
+from groq import (
+    APIError,
+    AuthenticationError,
+    InternalServerError,
+    NotFoundError,
+    PermissionDeniedError,
+    RateLimitError,
+)
 
 from app.answer_generator import (
     GeneratedAnswer,
@@ -22,7 +31,7 @@ from app.answer_generator import (
     build_prompt,
     format_sources,
     generate_answer,
-    get_gemini_client,
+    get_groq_client,
 )
 from app.retriever import SearchResult
 
@@ -41,6 +50,13 @@ def make_sample_chunk(
         metadata={"source": source, "page": page, "chunk_id": chunk_id, "doc_id": "doc1"},
         distance=distance,
     )
+
+
+def make_groq_error(error_cls, status_code: int, message: str):
+    """Helper to construct realistic Groq SDK exceptions with HTTP status codes."""
+    req = httpx.Request("POST", "https://api.groq.com/openai/v1/chat/completions")
+    resp = httpx.Response(status_code, request=req)
+    return error_cls(message, response=resp, body={"error": {"message": message}})
 
 
 def test_format_sources():
@@ -97,8 +113,8 @@ def test_build_prompt_grounding_instructions():
     assert "What is RAG?" in prompt
 
 
-def test_empty_chunks_skips_gemini_api_call():
-    """When chunks list is empty, generate_answer must NOT call the Gemini API."""
+def test_empty_chunks_skips_groq_api_call():
+    """When chunks list is empty, generate_answer must NOT call the Groq API."""
     mock_client = MagicMock()
 
     result = generate_answer("What is AI?", chunks=[], client=mock_client)
@@ -106,36 +122,49 @@ def test_empty_chunks_skips_gemini_api_call():
     assert isinstance(result, GeneratedAnswer)
     assert "No relevant documents were found" in result.answer
     assert result.sources == []
-    # Verify generate_content was NEVER invoked
-    mock_client.models.generate_content.assert_not_called()
+    # Verify chat.completions.create was NEVER invoked
+    mock_client.chat.completions.create.assert_not_called()
 
 
 def test_successful_answer_generation():
     """generate_answer should return text and source citations when model succeeds."""
     mock_client = MagicMock()
+    mock_choice = MagicMock()
+    mock_choice.message.content = "RAG grounds LLM outputs in verified external facts."
     mock_response = MagicMock()
-    mock_response.text = "RAG grounds LLM outputs in verified external facts."
-    mock_client.models.generate_content.return_value = mock_response
+    mock_response.choices = [mock_choice]
+    mock_client.chat.completions.create.return_value = mock_response
 
     chunks = [make_sample_chunk(source="paper.pdf", page=3)]
-    result = generate_answer("Explain RAG", chunks=chunks, client=mock_client, model="gemini-3.8-flash")
+    result = generate_answer(
+        "Explain RAG",
+        chunks=chunks,
+        client=mock_client,
+        model="openai/gpt-oss-20b",
+    )
 
     assert isinstance(result, GeneratedAnswer)
     assert result.answer == "RAG grounds LLM outputs in verified external facts."
-    assert result.model == "gemini-3.8-flash"
+    assert result.model == "openai/gpt-oss-20b"
     assert len(result.sources) == 1
     assert result.sources[0]["source"] == "paper.pdf"
     assert result.sources[0]["page"] == 3
 
-    mock_client.models.generate_content.assert_called_once()
+    mock_client.chat.completions.create.assert_called_once()
+    args, kwargs = mock_client.chat.completions.create.call_args
+    assert kwargs["model"] == "openai/gpt-oss-20b"
+    assert len(kwargs["messages"]) == 1
+    assert "Explain RAG" in kwargs["messages"][0]["content"]
 
 
 def test_empty_model_response_handling():
-    """Empty or None text response from Gemini should return an informative message."""
+    """Empty content from Groq should return an informative fallback message."""
     mock_client = MagicMock()
+    mock_choice = MagicMock()
+    mock_choice.message.content = ""  # Empty string
     mock_response = MagicMock()
-    mock_response.text = ""  # Empty string
-    mock_client.models.generate_content.return_value = mock_response
+    mock_response.choices = [mock_choice]
+    mock_client.chat.completions.create.return_value = mock_response
 
     chunks = [make_sample_chunk()]
     result = generate_answer("A question", chunks=chunks, client=mock_client)
@@ -144,40 +173,51 @@ def test_empty_model_response_handling():
     assert len(result.sources) == 1
 
 
-def test_api_error_invalid_key_400():
-    """HTTP 400 API_KEY_INVALID should return a helpful configuration error."""
+def test_api_error_authentication_401():
+    """HTTP 401 AuthenticationError should return a helpful configuration error."""
     mock_client = MagicMock()
-    mock_err = APIError(400, "API_KEY_INVALID: Invalid API key")
-    mock_err.code = 400
-    mock_client.models.generate_content.side_effect = mock_err
+    mock_err = make_groq_error(AuthenticationError, 401, "Invalid API Key")
+    mock_client.chat.completions.create.side_effect = mock_err
 
     chunks = [make_sample_chunk()]
     result = generate_answer("Question", chunks=chunks, client=mock_client)
 
-    assert "Invalid API key" in result.answer
-    assert "GEMINI_API_KEY in the .env file" in result.answer
+    assert "Authentication failed" in result.answer
+    assert "GROQ_API_KEY in the .env file" in result.answer
+
+
+def test_api_error_permission_denied_403():
+    """HTTP 403 PermissionDeniedError should return an authentication/permission error."""
+    mock_client = MagicMock()
+    mock_err = make_groq_error(PermissionDeniedError, 403, "Permission Denied")
+    mock_client.chat.completions.create.side_effect = mock_err
+
+    chunks = [make_sample_chunk()]
+    result = generate_answer("Question", chunks=chunks, client=mock_client)
+
+    assert "Authentication failed" in result.answer
+    assert "GROQ_API_KEY" in result.answer
 
 
 def test_api_error_model_not_found_404():
     """HTTP 404 model not found should return a model-specific configuration error."""
     mock_client = MagicMock()
-    mock_err = APIError(404, "NOT_FOUND: models/unknown-model is not found")
-    mock_err.code = 404
-    mock_client.models.generate_content.side_effect = mock_err
+    mock_err = make_groq_error(NotFoundError, 404, "Model not found")
+    mock_client.chat.completions.create.side_effect = mock_err
 
     chunks = [make_sample_chunk()]
     result = generate_answer("Question", chunks=chunks, client=mock_client, model="unknown-model")
 
     assert "was not found (404)" in result.answer
     assert "unknown-model" in result.answer
+    assert "GROQ_MODEL" in result.answer
 
 
 def test_api_error_quota_exceeded_429():
     """HTTP 429 quota or rate limit should return a clear wait-and-retry message."""
     mock_client = MagicMock()
-    mock_err = APIError(429, "RESOURCE_EXHAUSTED: Rate limit exceeded")
-    mock_err.code = 429
-    mock_client.models.generate_content.side_effect = mock_err
+    mock_err = make_groq_error(RateLimitError, 429, "Rate limit reached")
+    mock_client.chat.completions.create.side_effect = mock_err
 
     chunks = [make_sample_chunk()]
     result = generate_answer("Question", chunks=chunks, client=mock_client)
@@ -185,12 +225,11 @@ def test_api_error_quota_exceeded_429():
     assert "Quota or rate limit exceeded (429)" in result.answer
 
 
-def test_api_error_service_unavailable_503():
-    """HTTP 503 service unavailable should report temporary overload without crashing."""
+def test_api_error_service_unavailable_5xx():
+    """HTTP 5xx server error should report temporary overload without crashing."""
     mock_client = MagicMock()
-    mock_err = APIError(503, "UNAVAILABLE: Service overloaded")
-    mock_err.code = 503
-    mock_client.models.generate_content.side_effect = mock_err
+    mock_err = make_groq_error(InternalServerError, 503, "Service unavailable")
+    mock_client.chat.completions.create.side_effect = mock_err
 
     chunks = [make_sample_chunk()]
     result = generate_answer("Question", chunks=chunks, client=mock_client)
@@ -221,10 +260,9 @@ def test_input_validation():
 
 
 def test_api_key_configuration_validation():
-    """Placeholder or empty API keys must raise ValueError with clear guidance."""
-    with pytest.raises(ValueError, match="GEMINI_API_KEY is not configured"):
-        get_gemini_client(api_key="")
+    """Placeholder or empty Groq API keys must raise ValueError with clear guidance."""
+    with pytest.raises(ValueError, match="GROQ_API_KEY is not configured"):
+        get_groq_client(api_key="")
 
     with pytest.raises(ValueError, match="placeholder"):
-        get_gemini_client(api_key="your_gemini_api_key_here")
-
+        get_groq_client(api_key="gsk_your_groq_api_key_here")

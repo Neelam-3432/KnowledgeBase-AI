@@ -5,4 +5,4 @@ pypdf
 pytest
 sentence-transformers
 chromadb
-s
+groq
